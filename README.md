@@ -20,7 +20,7 @@ CoSMO addresses severe class imbalance (up to 50:1 ratio in DermaMNIST) by:
 2. **Stage 2 — Latent SMOTE**: Generating synthetic minority-class samples via SMOTE interpolation directly within the structured latent space, decoding each synthetic latent using skip features borrowed from its nearest real neighbour, and training downstream classifiers on the resulting balanced dataset.
 
 <p align="center">
-  <img src="assets/workflow.png" width="800" alt="CoSMO pipeline overview"/>
+  <img src="/workflow.png" width="800" alt="CoSMO pipeline overview"/>
 </p>
 
 ---
