@@ -330,6 +330,13 @@ def derma_classification(params, args, model_names, balanced_data, balanced_labe
                 target_layers = [final_classifier.head if hasattr(final_classifier, 'head') else final_classifier]
             print(f"GradCAM Target Layer for ViM: {target_layers[0].__class__.__name__}")
 
+        elif model_name == 'vim_real':
+            # official Vision Mamba (hustvl/Vim), see vim_real/; needs the 'vimreal' conda env
+            sys.path.insert(0, str(Path(__file__).resolve().parent / 'vim_real'))
+            from vim_real_model import build_vim_real
+            final_classifier = build_vim_real(num_classes=args['num_class'])
+            target_layers = None
+
         elif model_name == 'vit':
             chosen_patch_size = 8 if args['img_size'] <= 64 else (16 if args['img_size'] <= 128 else 32)
             final_classifier  = ViT(
@@ -357,7 +364,9 @@ def derma_classification(params, args, model_names, balanced_data, balanced_labe
         # experiment_tag so runs never overwrite each other
         # -----------------------------------------------------------------------
         log_dir_name  = f"{experiment_tag}_{model_name}_lr{params['lr']}_z{params['n_z']}"
-        full_log_path = f"/home/s2522002/Experiment/Tensorboard_nz{params['n_z']}/{log_dir_name}"
+        # 'out_root' (optional) redirects all outputs, e.g. for the ablation runs
+        _out_root = params.get('out_root', './outputs')
+        full_log_path = f"{_out_root}/Tensorboard_nz{params['n_z']}/{log_dir_name}"
 
         if os.path.exists(full_log_path):
             shutil.rmtree(full_log_path)
@@ -377,7 +386,7 @@ def derma_classification(params, args, model_names, balanced_data, balanced_labe
             if device.type == 'cuda':
                 try:
                     scaler = torch.amp.GradScaler('cuda')
-                except TypeError:
+                except (TypeError, AttributeError):   # torch < 2.3 (e.g. the 'vimreal' env) has no torch.amp.GradScaler
                     scaler = torch.cuda.amp.GradScaler()
             else:
                 scaler = torch.amp.GradScaler()
@@ -452,7 +461,7 @@ def derma_classification(params, args, model_names, balanced_data, balanced_labe
             # GradCAM phase
             first_epoch = 0
             mid_epoch   = args['classifier_epochs'] // 2
-            is_gradcam_epoch = (
+            is_gradcam_epoch = (model_name != 'vim_real') and (   # no Grad-CAM for official Vim
                 epoch in [first_epoch, mid_epoch]
                 or (epochs_no_improve + 1 >= patience)
                 or (epoch == args['classifier_epochs'] - 1)
@@ -644,11 +653,13 @@ def derma_classification(params, args, model_names, balanced_data, balanced_labe
         #   imbalanced_data_noaugment_vit_lr0.0001_z512.pth
         # -----------------------------------------------------------------------
         if best_model_state is not None:
-            save_models_dir = Path(f"/home/s2522002/Experiment/Results_nz{params['n_z']}/Saved_Models")
+            save_models_dir = Path(f"{params.get('out_root', './outputs')}/Results_nz{params['n_z']}/Saved_Models")
             save_models_dir.mkdir(parents=True, exist_ok=True)
 
+            # 'fold' (optional) keeps one weight file per fold instead of overwriting
+            _fold_sfx = f"_fold{params['fold']}" if 'fold' in params else ""
             model_weights_filename = (
-                f"{experiment_tag}_{model_name.lower()}_lr{params['lr']}_z{params['n_z']}.pth"
+                f"{experiment_tag}_{model_name.lower()}_lr{params['lr']}_z{params['n_z']}{_fold_sfx}.pth"
             )
             target_save_path = save_models_dir / model_weights_filename
             torch.save(best_model_state, target_save_path)
@@ -678,6 +689,16 @@ def derma_classification(params, args, model_names, balanced_data, balanced_labe
         true_labels = torch.cat(all_true).numpy()
         pred_labels = torch.cat(all_pred).numpy()
         prob_labels = np.concatenate(all_probs, axis=0)
+
+        # 'pred_dir' (optional): save per-image test predictions, in test-set order
+        if params.get('pred_dir'):
+            _pred_dir = Path(params['pred_dir'])
+            _pred_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                _pred_dir / (f"pred_{experiment_tag}_{model_name.lower()}_z{params['n_z']}"
+                             f"_fold{params.get('fold', 0)}.npz"),
+                y_true=true_labels, y_pred=pred_labels, prob=prob_labels
+            )
 
         res_f1   = f1_score(true_labels, pred_labels, average='macro', zero_division=0)
         res_asca = balanced_accuracy_score(true_labels, pred_labels)
@@ -723,7 +744,8 @@ def derma_classification(params, args, model_names, balanced_data, balanced_labe
 
         all_model_results[model_name] = {
             'f1': res_f1, 'asca': res_asca, 'acc': res_acc,
-            'auc': res_auc, 'gmean': res_gm
+            'auc': res_auc, 'gmean': res_gm,
+            'best_val_f1': best_val_f1   # validation macro F1 of the early-stopping checkpoint (for n_z selection)
         }
 
         print(f"{model_name} Final Test | ACC: {res_acc:.4f} | AUC: {res_auc:.4f} | "

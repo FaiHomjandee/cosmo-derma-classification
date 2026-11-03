@@ -13,7 +13,8 @@ interpolation in the structured latent space, decoding each synthetic
 latent using skip features borrowed from its nearest real neighbor.
 
 Usage:
-    python run_sampling.py --data_dir ./data --out_dir ./outputs --n_z 512
+    python run_sampling.py --n_z 128 512                                   # CoSMO
+    python run_sampling.py --n_z 128 512 --alpha 1.0 --out_dir ./outputs/balanced_ae_smote  # AE+SMOTE
 """
 
 import os
@@ -41,8 +42,8 @@ from Derma_CoSMO_modified import run_cosmo_resampling
 # ── Argument parsing ───────────────────────────────────────────────────
 def get_args():
     parser = argparse.ArgumentParser(description="CoSMO: Stage 1 -- Oversampling")
-    parser.add_argument("--data_dir",  type=str, default="./data",
-                        help="Directory containing dermamnist_folds_data.pth")
+    parser.add_argument("--data_dir",  type=str, default="./data/prepared",
+                        help="Directory with dermamnist_fold{k}_data.pth (prepare_folds.py)")
     parser.add_argument("--out_dir",   type=str, default="./outputs/balanced",
                         help="Directory to save balanced_data checkpoints")
     parser.add_argument("--fid_dir",   type=str, default="./outputs/fid",
@@ -57,7 +58,7 @@ def get_args():
     parser.add_argument("--batch_size",type=int, default=32)
     parser.add_argument("--lr",        type=float, default=2e-4)
     parser.add_argument("--alpha",     type=float, default=0.5,
-                        help="Weight for reconstruction loss (default: 0.5)")
+                        help="Weight of L_rec (0.5 = CoSMO; 1.0 = AE+SMOTE ablation, no contrastive loss)")
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--dataset",   type=str, default="dermamnist")
@@ -84,20 +85,7 @@ def main():
         "img_size":   224,
     }
 
-    # ── Load fold data ─────────────────────────────────────────────────
-    folds_path = DATA_DIR / f"{args_cli.dataset}_folds_data.pth"
-    print(f"Loading folds data from {folds_path} ...")
-    folds_data = torch.load(folds_path, weights_only=False)
-    print(f"Loaded {len(folds_data)} folds.\n")
-
-    # Rebuild real imbalanced training list for each fold
-    imbalanced_lists = []
-    for fold_loaders in folds_data:
-        train_loader_ae = fold_loaders[0]
-        ds = train_loader_ae.dataset
-        real_data   = ds.tensors[0]
-        real_labels = ds.tensors[1].view(-1)
-        imbalanced_lists.append(list(zip(real_data, real_labels)))
+    # Fold files are loaded one at a time inside the loop (see prepare_folds.py)
 
     # ── Sweep over n_z and folds ───────────────────────────────────────
     for n_z in args_cli.n_z:
@@ -133,12 +121,18 @@ def main():
             params_fold["fold_idx"] = fold_num
             params_fold["fid_dir"]  = str(FID_DIR)
 
+            fold_loaders = torch.load(DATA_DIR / f"{args_cli.dataset}_fold{fold_num}_data.pth",
+                                      weights_only=False)
+            ds = fold_loaders[0].dataset
+            imbalanced = list(zip(ds.tensors[0], ds.tensors[1].view(-1)))
+
             balanced_data, balanced_labels, enc_state, dec_state = run_cosmo_resampling(
                 params=params_fold,
                 args=model_args,
-                fold_data_loaders=folds_data[fold_idx],
-                imbalanced_train_dataset=imbalanced_lists[fold_idx],
+                fold_data_loaders=fold_loaders,
+                imbalanced_train_dataset=imbalanced,
             )
+            del fold_loaders, imbalanced
 
             # Memory cleanup before saving
             gc.collect();  torch.cuda.empty_cache()

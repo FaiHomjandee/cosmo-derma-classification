@@ -573,7 +573,7 @@ def run_cosmo_resampling(params, args, fold_data_loaders, imbalanced_train_datas
 
         if fid_results:
             fold_idx = params.get('fold_idx', 1)  # defaults to 1 if not provided
-            output_dir = (f"/home/s2522002/Experiment/sim_score/{dataset_name}/"
+            output_dir = (f"{params.get('out_root', './outputs')}/sim_score/{dataset_name}/"
                         f"FID_Results/fold{fold_idx}")
             os.makedirs(output_dir, exist_ok=True)
             csv_path = os.path.join(output_dir, f"FID_Scores_sampled_nz_{params['n_z']}.csv")

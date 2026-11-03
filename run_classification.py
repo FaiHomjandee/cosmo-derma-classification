@@ -1,227 +1,169 @@
 #!/usr/bin/env python
-# coding: utf-8
 """
-CoSMO: Contrastive Synthetic Minority Oversampling
-Stage 2 -- Downstream classification
+CoSMO, Stage 2: train the downstream classifiers and save per-image test
+predictions for every fold.
 
-Loads the fold-aligned balanced_data checkpoints produced by
-run_sampling.py and trains/evaluates five classifier architectures
-(ResNet-18, EfficientNet-B0, MobileNet-V2, ViT, ViM) using 5-fold
-cross-validation.  Results are saved as a CSV with per-fold and
-average metrics (F1, G-mean, AUC, ACC, balanced accuracy).
+Every condition uses IDENTICAL classifier settings (AdamW, lr 1e-4,
+weight decay 1e-2, label smoothing 0.1, 100 epochs, batch size 8). Validation
+and test sets are always the real images of the fold.
 
-Usage:
-    # CoSMO condition
-    python run_classification.py --tag balanced_data --n_z 512 \\
-        --data_dir ./data --balanced_dir ./outputs/balanced
+Conditions (--conditions):
+    imb_noaug   real imbalanced data, no augmentation
+    aug_only    real imbalanced data + augmentation
+    ae_smote    autoencoder + latent SMOTE without the contrastive loss
+                (run_sampling.py --alpha 1.0 --out_dir outputs/balanced_ae_smote)
+    cosmo       CoSMO (run_sampling.py --alpha 0.5 --out_dir outputs/balanced)
+    ros         random oversampling of real minority images (supplementary only)
 
-    # Aug-only baseline
-    python run_classification.py --tag imbalanced_data \\
-        --data_dir ./data
+Latent dimension per architecture (Table 4): ResNet-18 / ViT 128, others 512.
 
-    # No-augmentation baseline
-    python run_classification.py --tag imbalanced_data_noaugment \\
-        --data_dir ./data
+Outputs:
+    <out_dir>/results/results_<condition>.csv
+    <out_dir>/predictions/pred_<tag>_<model>_z<nz>_fold<k>.npz  (y_true, y_pred, prob)
+
+Examples:
+    python run_classification.py --conditions imb_noaug aug_only ae_smote cosmo \
+        --models resnet18 efficientnet_b0 mobilenet_v2 vit
+    # Vision Mamba from scratch (needs the 'vimreal' env, see vim_real/)
+    python run_classification.py --conditions imb_noaug aug_only ae_smote cosmo \
+        --models vim_real --vim-scratch
+    # ImageNet-pretrained Vision Mamba (reference row)
+    python run_classification.py --conditions imb_noaug aug_only ae_smote cosmo --models vim_real
 """
-
-import os
-import itertools
-import time
 import argparse
+import gc
+import os
+import sys
+import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 
-from Derma_classification_lowmem import derma_classification
+ROOT = Path(__file__).resolve().parent
+
+# The official Vim must be imported before smote_variants / OpenCV (CUDA library clash).
+if "vim_real" in sys.argv:
+    sys.path.insert(0, str(ROOT / "vim_real"))
+    import vim_real_model  # noqa: F401
+
+from Derma_classification_lowmem import derma_classification  # noqa: E402
+
+DATA = "dermamnist"
+MODELS = ["resnet18", "efficientnet_b0", "mobilenet_v2", "vit", "vim_real"]
+BEST_NZ = {"resnet18": 128, "vit": 128, "efficientnet_b0": 512, "mobilenet_v2": 512, "vim_real": 512}
+AE_LR = 0.0002  # autoencoder lr, part of the balanced-data file names
+TAGS = {"imb_noaug": "imbalanced_data_noaugment", "aug_only": "imbalanced_data",
+        "ros": "ros", "ae_smote": "ae_smote_alpha1.0", "cosmo": "balanced_data"}
+ARGS = {"dim_h": 128, "n_channel": 3, "num_class": 7, "batch_size": 8, "img_size": 224,
+        "classifier_epochs": 100}
 
 
-# ── Argument parsing ───────────────────────────────────────────────────
-def get_args():
-    parser = argparse.ArgumentParser(description="CoSMO: Stage 2 -- Classification")
-    parser.add_argument("--data_dir",     type=str, default="./data",
-                        help="Directory containing per-fold data files")
-    parser.add_argument("--balanced_dir", type=str, default="./outputs/balanced",
-                        help="Directory with balanced_data checkpoints (Stage 1 output)")
-    parser.add_argument("--out_dir",      type=str, default="./outputs/results",
-                        help="Directory to save result CSVs")
-    parser.add_argument("--tag",          type=str, default="balanced_data",
-                        choices=["balanced_data", "imbalanced_data",
-                                 "imbalanced_data_noaugment"],
-                        help="Experiment condition")
-    parser.add_argument("--n_z",          type=int, nargs="+",
-                        default=[64, 128, 256, 512],
-                        help="Latent dimension(s) to evaluate (balanced_data only)")
-    parser.add_argument("--n_folds",      type=int, default=5)
-    parser.add_argument("--epochs",       type=int, default=100,
-                        help="Classifier training epochs (default: 100)")
-    parser.add_argument("--batch_size",   type=int, default=8)
-    parser.add_argument("--lr",           type=float, default=2e-4)
-    parser.add_argument("--alpha",        type=float, default=0.5)
-    parser.add_argument("--temperature",  type=float, default=0.07)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
-    parser.add_argument("--dataset",      type=str, default="dermamnist")
-    parser.add_argument("--models",       type=str, nargs="+",
-                        default=["resnet18", "efficientnet_b0", "mobilenet_v2",
-                                 "vit", "vim"],
-                        help="Architectures to evaluate")
-    parser.add_argument("--gpu",          type=str, default="0")
-    return parser.parse_args()
+def real_train(train_loader):
+    ds = train_loader.dataset
+    return ds.tensors[0], ds.tensors[1].view(-1)
 
 
-# ── Main ───────────────────────────────────────────────────────────────
+def random_oversample(X, y, seed):
+    rng = np.random.default_rng(seed)
+    y_np = y.numpy(); n_max = np.bincount(y_np).max(); idx = []
+    for c in np.unique(y_np):
+        c_idx = np.where(y_np == c)[0]; idx.append(c_idx)
+        if len(c_idx) < n_max:
+            idx.append(rng.choice(c_idx, n_max - len(c_idx), replace=True))
+    idx = torch.from_numpy(np.concatenate(idx))
+    return X[idx], y[idx]
+
+
 def main():
-    args_cli = get_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = args_cli.gpu
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--conditions", nargs="+", required=True, choices=list(TAGS))
+    ap.add_argument("--models", nargs="+", default=MODELS[:4], choices=MODELS)
+    ap.add_argument("--folds", type=int, nargs="+", default=[1, 2, 3, 4, 5])
+    ap.add_argument("--data_dir", default=str(ROOT / "data" / "prepared"))
+    ap.add_argument("--cosmo_dir", default=str(ROOT / "outputs" / "balanced"))
+    ap.add_argument("--ae_smote_dir", default=str(ROOT / "outputs" / "balanced_ae_smote"))
+    ap.add_argument("--out_dir", default=None,
+                    help="default: outputs/ablation (outputs/ablation_vim_scratch with --vim-scratch)")
+    ap.add_argument("--clf-lr", type=float, default=1e-4)
+    ap.add_argument("--clf-wd", type=float, default=1e-2)
+    ap.add_argument("--vim-scratch", action="store_true",
+                    help="train vim_real from random initialisation (the from-scratch Vim in Table 4)")
+    ap.add_argument("--sweep-nz", type=int, default=None, choices=[64, 128, 256, 512],
+                    help="use this n_z for every model (latent-dimension sweep, Section 5.9)")
+    a = ap.parse_args()
 
-    DATA_DIR     = Path(args_cli.data_dir)
-    BALANCED_DIR = Path(args_cli.balanced_dir)
-    OUT_DIR      = Path(args_cli.out_dir);  OUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not torch.cuda.is_available():
+        sys.exit("ERROR: no GPU visible (torch.cuda.is_available() is False).")
 
-    model_args = {
-        "dim_h":              128,
-        "n_channel":          3,
-        "num_class":          7,
-        "batch_size":         args_cli.batch_size,
-        "img_size":           224,
-        "classifier_epochs":  args_cli.epochs,
-    }
+    out = Path(a.out_dir) if a.out_dir else ROOT / "outputs" / ("ablation_vim_scratch" if a.vim_scratch else "ablation")
+    if a.vim_scratch:
+        os.environ["VIM_REAL_PRETRAINED"] = "0"
+    if a.sweep_nz is not None:
+        for m in a.models:
+            BEST_NZ[m] = a.sweep_nz
+        out = out / f"nz_sweep/nz{a.sweep_nz}"
+    res_dir, pred_dir = out / "results", out / "predictions"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
 
-    # For baselines, n_z is irrelevant (no balanced checkpoint needed);
-    # use a dummy list of one value so the outer loop runs once.
-    nz_list = args_cli.n_z if args_cli.tag == "balanced_data" else [None]
+    for cond in a.conditions:
+        tag = TAGS[cond]
+        synthetic = cond in ("ae_smote", "cosmo")
+        res_path = res_dir / f"results_{cond}.csv"
+        rows = pd.read_csv(res_path).to_dict("records") if res_path.exists() else []
+        rows = [r for r in rows if float(r["clf_lr"]) == a.clf_lr and float(r["clf_wd"]) == a.clf_wd]
+        done = {(int(r["Fold"]), r["Model"]) for r in rows}
 
-    for n_z in nz_list:
-        params = {
-            "lr":           args_cli.lr,
-            "alpha":        args_cli.alpha,
-            "temperature":  args_cli.temperature,
-            "n_z":          n_z,
-            "weight_decay": args_cli.weight_decay,
-            "dataset_name": args_cli.dataset,
-            "experiment_tag": args_cli.tag,
-        }
+        groups = {}
+        for m in a.models:
+            groups.setdefault(BEST_NZ[m] if synthetic else 0, []).append(m)
 
-        tag_str = args_cli.tag if n_z is None else f"{args_cli.tag}_nz{n_z}"
-        models_str = "_".join(args_cli.models)
-        results_path = OUT_DIR / f"{args_cli.dataset}_{tag_str}_{models_str}.csv"
-
-        print(f"\n{'='*60}")
-        print(f"Condition: {args_cli.tag}  |  n_z: {n_z}")
-        print(f"{'='*60}")
-
-        # ── Resume: skip folds already in the CSV ──────────────────────
-        completed = {}
-        results_list = []
-        if results_path.exists():
-            df_ex = pd.read_csv(results_path)
-            df_ex = df_ex[df_ex["Fold"] != "Average"]
-            for fold_num, fold_df in df_ex.groupby("Fold"):
-                if set(fold_df["Model"]) >= set(args_cli.models):
-                    completed[int(fold_num)] = fold_df.to_dict("records")
-                    results_list.extend(completed[int(fold_num)])
-                    print(f"Resuming: fold {fold_num} already complete, skipping.")
-
-        fold_tracker = []
-
-        for fold_idx in range(args_cli.n_folds):
-            fold_num = fold_idx + 1
-
-            if fold_num in completed:
-                fold_tracker.extend(completed[fold_num])
-                continue
-
-            # Load per-fold data
-            fold_path = DATA_DIR / f"{args_cli.dataset}_fold{fold_num}_data.pth"
-            if not fold_path.exists():
-                # Fallback: try loading the full folds_data.pth
-                full_path = DATA_DIR / f"{args_cli.dataset}_folds_data.pth"
-                if not full_path.exists():
-                    print(f"ERROR: no fold data found at {fold_path} or {full_path}")
+        for fold in a.folds:
+            for nz, models in groups.items():
+                todo = [m for m in models if (fold, m) not in done]
+                if not todo:
                     continue
-                all_folds = torch.load(full_path, weights_only=False)
-                train_loader_ae, cv_val_loader, test_loader = all_folds[fold_idx]
-            else:
-                train_loader_ae, cv_val_loader, test_loader = torch.load(
-                    fold_path, weights_only=False)
+                print(f"\n== {cond} | fold {fold} | n_z {nz} | {todo}")
+                train_loader, val_loader, test_loader = torch.load(
+                    Path(a.data_dir) / f"{DATA}_fold{fold}_data.pth", weights_only=False)
 
-            # ── Prepare training data ──────────────────────────────────
-            if args_cli.tag == "balanced_data":
-                fname = (f"{args_cli.dataset}_fold{fold_num}"
-                         f"_lr{params['lr']}_alpha{params['alpha']}_z{n_z}.pth")
-                ckpt_path = BALANCED_DIR / fname
-                if not ckpt_path.exists():
-                    print(f"Missing checkpoint: {ckpt_path}, skipping fold {fold_num}.")
-                    continue
-                ckpt = torch.load(ckpt_path, weights_only=False)
-                X_train = ckpt["balanced_data"]
-                y_train = ckpt["balanced_labels"].view(-1)
-                print(f"\n[BALANCED] Fold {fold_num} | Train: {X_train.shape[0]}")
-                del ckpt
+                if cond in ("imb_noaug", "aug_only"):
+                    X, y = real_train(train_loader)
+                elif cond == "ros":
+                    X, y = random_oversample(*real_train(train_loader), seed=42 + fold)
+                else:
+                    alpha = 0.5 if cond == "cosmo" else 1.0
+                    src = Path(a.cosmo_dir if cond == "cosmo" else a.ae_smote_dir)
+                    path = src / f"{DATA}_fold{fold}_lr{AE_LR}_alpha{alpha}_z{nz}.pth"
+                    if not path.exists():
+                        print(f"[MISSING] {path} - run run_sampling.py first"); continue
+                    ck = torch.load(path, weights_only=False)
+                    X, y = ck["balanced_data"], ck["balanced_labels"].view(-1); del ck
 
-            else:
-                imgs_list, labs_list = [], []
-                for imgs, labs in train_loader_ae:
-                    imgs_list.append(imgs)
-                    labs_list.append(labs.view(-1))
-                X_train = torch.cat(imgs_list)
-                y_train = torch.cat(labs_list)
-                print(f"\n[{args_cli.tag.upper()}] Fold {fold_num} | Train: {X_train.shape[0]}")
-                print(f"  Distribution: {torch.bincount(y_train)}")
+                torch.manual_seed(42 + fold); np.random.seed(42 + fold)
+                params = {"lr": a.clf_lr, "weight_decay": a.clf_wd, "n_z": nz, "dataset_name": DATA,
+                          "experiment_tag": tag, "fold": fold, "out_root": str(out), "pred_dir": str(pred_dir)}
+                results = derma_classification(params=params, args=ARGS, model_names=todo,
+                                               balanced_data=X, balanced_labels=y,
+                                               val_loader=val_loader, test_loader=test_loader)
+                del X, y, train_loader, val_loader, test_loader
+                gc.collect(); torch.cuda.empty_cache()
 
-            # ── Train & evaluate ───────────────────────────────────────
-            results = derma_classification(
-                params=params,
-                args=model_args,
-                model_names=args_cli.models,
-                balanced_data=X_train,
-                balanced_labels=y_train,
-                val_loader=cv_val_loader,
-                test_loader=test_loader,
-            )
-            del X_train, y_train
+                for m, met in results.items():
+                    rows.append({"condition": cond, "experiment_tag": tag, "Fold": fold, "Model": m, "n_z": nz,
+                                 "clf_lr": a.clf_lr, "clf_wd": a.clf_wd,
+                                 "F1": met.get("f1", 0.0), "GM": met.get("gmean", 0.0),
+                                 "AUC": met.get("auc", 0.0), "ACC": met.get("acc", 0.0),
+                                 "val_F1": met.get("best_val_f1", float("nan"))})
+                    done.add((fold, m))
+                pd.DataFrame(rows).to_csv(res_path, index=False)
 
-            for model_name, metrics in results.items():
-                row = params.copy()
-                row.update({
-                    "Fold":  fold_num,
-                    "Model": model_name,
-                    "F1":    metrics.get("f1",    0.0),
-                    "ASCA":  metrics.get("asca",  0.0),
-                    "GM":    metrics.get("gmean", 0.0),
-                    "AUC":   metrics.get("auc",   0.0),
-                    "ACC":   metrics.get("acc",   0.0),
-                })
-                results_list.append(row)
-                fold_tracker.append(row)
-
-            pd.DataFrame(results_list).to_csv(results_path, index=False)
-
-        # ── Fold averages ──────────────────────────────────────────────
-        df_t = pd.DataFrame(fold_tracker)
-        if not df_t.empty:
-            print(f"\nSummary [{tag_str}]:")
-            for model_name in df_t["Model"].unique():
-                mdf = df_t[df_t["Model"] == model_name]
-                avg = params.copy()
-                avg.update({
-                    "Fold":    "Average",
-                    "Model":   model_name,
-                    "F1":      mdf["F1"].mean(),
-                    "ASCA":    mdf["ASCA"].mean(),
-                    "GM":      mdf["GM"].mean(),
-                    "AUC":     mdf["AUC"].mean(),
-                    "ACC":     mdf["ACC"].mean(),
-                    "Std_F1":  mdf["F1"].std(),
-                    "Std_ACC": mdf["ACC"].std(),
-                })
-                results_list.append(avg)
-                print(f"  {model_name:18}: "
-                      f"F1={avg['F1']:.4f}±{avg['Std_F1']:.4f} | "
-                      f"ACC={avg['ACC']:.4f}±{avg['Std_ACC']:.4f}")
-            pd.DataFrame(results_list).to_csv(results_path, index=False)
-
-    print("\nDone. Results saved to", OUT_DIR)
+        if rows:
+            df = pd.DataFrame(rows)
+            print(df.groupby("Model")[["F1", "GM", "AUC", "ACC"]].agg(["mean", "std"]).round(4).to_string())
+    print(f"\nDone in {(time.time() - t0) / 3600:.2f} h")
 
 
 if __name__ == "__main__":
